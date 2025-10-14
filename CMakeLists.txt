@@ -27,9 +27,11 @@ message (STATUS "get file srcs lits: " ${FILE_SRCS})
 
 add_executable (avm_cali avm_cali_demo.cpp ./srcs/common.cpp)
 add_executable (avm_app avm_app_demo.cpp ./srcs/common.cpp)
+add_executable (test_cam test_cam.cpp)
 
 include_directories(${OpenCV_INCLUDE_DIRS})
 link_directories(${OpenCV_LIBRARY_DIRS})
 
 target_link_libraries(avm_cali ${OpenCV_LIBS})
 target_link_libraries(avm_app ${OpenCV_LIBS})
+target_link_libraries(test_cam ${OpenCV_LIBS})
