@@ -3,17 +3,163 @@
  * author: joker.mao
  * date: 2023/07/15
  * copyright: ADAS_EYES all right reserved
- * modification: Changed to real-time camera input
+ * modification: Further optimization for undistort and transform
  */
 
 #include "common.h"
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <mutex>
+#include <cstring>
 
 // #define DEBUG
 #define AWB_LUN_BANLANCE_ENALE 1
 // #define DEBUG 0
+
+// 全局变量用于多线程
+std::mutex g_mutex;
+std::atomic<bool> g_processing_complete(false);
+
+// 预计算映射表结构
+struct UndistortMaps
+{
+    cv::Mat map1;
+    cv::Mat map2;
+};
+
+// 预计算每个相机的映射表
+UndistortMaps precomputeUndistortMaps(const CameraPrms &prm)
+{
+    UndistortMaps maps;
+
+    // 获取新的相机矩阵
+    cv::Mat new_camera_matrix = prm.camera_matrix.clone();
+    double *matrix_data = (double *)new_camera_matrix.data;
+
+    const auto scale = (const float *)(prm.scale_xy.data);
+    const auto shift = (const float *)(prm.shift_xy.data);
+
+    if (matrix_data && scale && shift)
+    {
+        matrix_data[0] *= (double)scale[0];
+        matrix_data[3 * 1 + 1] *= (double)scale[1];
+        matrix_data[2] += (double)shift[0];
+        matrix_data[1 * 3 + 2] += (double)shift[1];
+    }
+
+    // 预计算映射表
+    cv::fisheye::initUndistortRectifyMap(prm.camera_matrix, prm.dist_coff, cv::Mat(),
+                                         new_camera_matrix, prm.size, CV_16SC2,
+                                         maps.map1, maps.map2);
+
+    return maps;
+}
+
+// 多线程处理单个摄像头图像的函数
+void processCameraImage(cv::Mat &src, cv::Mat &dst, const CameraPrms &prm,
+                        const UndistortMaps &maps, const char *flip_mir)
+{
+    try
+    {
+        cv::Mat temp_src = src.clone();
+
+        // 使用预计算的映射表进行畸变校正
+        cv::remap(temp_src, temp_src, maps.map1, maps.map2, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
+
+        // 透视变换
+        cv::warpPerspective(temp_src, temp_src, prm.project_matrix, project_shapes[prm.name]);
+
+        // 旋转处理 - 使用 C 风格字符串比较
+        if (strcmp(flip_mir, "r+") == 0)
+        {
+            cv::rotate(temp_src, temp_src, cv::ROTATE_90_CLOCKWISE);
+        }
+        else if (strcmp(flip_mir, "r-") == 0)
+        {
+            cv::rotate(temp_src, temp_src, cv::ROTATE_90_COUNTERCLOCKWISE);
+        }
+        else if (strcmp(flip_mir, "m") == 0)
+        {
+            cv::rotate(temp_src, temp_src, cv::ROTATE_180);
+        }
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+        temp_src.copyTo(dst);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Error processing camera image: " << e.what() << std::endl;
+    }
+}
+
+// 优化版本：合并畸变校正和透视变换
+void optimizedProcessCameraImage(cv::Mat &src, cv::Mat &dst, const CameraPrms &prm,
+                                 const UndistortMaps &maps, const char *flip_mir)
+{
+    try
+    {
+        // 使用预计算的映射表进行畸变校正
+        cv::Mat undistorted;
+        cv::remap(src, undistorted, maps.map1, maps.map2, cv::INTER_LINEAR, cv::BORDER_CONSTANT);
+
+        // 透视变换
+        cv::Mat transformed;
+        cv::warpPerspective(undistorted, transformed, prm.project_matrix, project_shapes[prm.name]);
+
+        // 旋转处理
+        cv::Mat rotated;
+        if (strcmp(flip_mir, "r+") == 0)
+        {
+            cv::rotate(transformed, rotated, cv::ROTATE_90_CLOCKWISE);
+        }
+        else if (strcmp(flip_mir, "r-") == 0)
+        {
+            cv::rotate(transformed, rotated, cv::ROTATE_90_COUNTERCLOCKWISE);
+        }
+        else if (strcmp(flip_mir, "m") == 0)
+        {
+            cv::rotate(transformed, rotated, cv::ROTATE_180);
+        }
+        else
+        {
+            rotated = transformed;
+        }
+
+        std::lock_guard<std::mutex> lock(g_mutex);
+        rotated.copyTo(dst);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "Error processing camera image: " << e.what() << std::endl;
+    }
+}
+
+void processAllCamerasParallel(cv::Mat *origin_dir_img, cv::Mat *undist_dir_img,
+                               CameraPrms *prms, const UndistortMaps *maps,
+                               const char *camera_flip_mir[4])
+{
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < 4; ++i)
+    {
+        threads.emplace_back(optimizedProcessCameraImage,
+                             std::ref(origin_dir_img[i]),
+                             std::ref(undist_dir_img[i]),
+                             std::cref(prms[i]),
+                             std::cref(maps[i]),
+                             camera_flip_mir[i]);
+    }
+
+    for (auto &t : threads)
+    {
+        if (t.joinable())
+        {
+            t.join();
+        }
+    }
+}
 
 int main(int argc, char **argv)
 {
@@ -28,9 +174,11 @@ int main(int argc, char **argv)
     cv::Mat origin_dir_img[4];
     cv::Mat undist_dir_img[4];
     cv::Mat merge_weights_img[4];
+    cv::Mat weights_complement_img[4];
     cv::Mat out_put_img;
     float *w_ptr[4];
     CameraPrms prms[4];
+    UndistortMaps undistort_maps[4]; // 预计算的映射表
     int capture_width = 960;
     int capture_height = 640;
 
@@ -54,6 +202,7 @@ int main(int argc, char **argv)
     for (int i = 0; i < 4; ++i)
     {
         merge_weights_img[i] = cv::Mat(weights.size(), CV_32FC1, cv::Scalar(0, 0, 0));
+        weights_complement_img[i] = cv::Mat(weights.size(), CV_32FC1, cv::Scalar(0, 0, 0));
         w_ptr[i] = (float *)merge_weights_img[i].data;
     }
 
@@ -73,10 +222,17 @@ int main(int argc, char **argv)
         }
     }
 
+    // 计算权重补矩阵 (1 - weights)
+    for (int i = 0; i < 4; ++i)
+    {
+        cv::subtract(cv::Scalar(1.0), merge_weights_img[i], weights_complement_img[i]);
+    }
+
 #ifdef DEBUG
     for (int i = 0; i < 4; ++i)
     {
         display_mat(merge_weights_img[i], "w");
+        display_mat(weights_complement_img[i], "w_complement");
     }
 #endif
 
@@ -90,6 +246,9 @@ int main(int argc, char **argv)
         {
             return -1;
         }
+
+        // 预计算畸变校正映射表
+        undistort_maps[i] = precomputeUndistortMaps(prm);
     }
 
     // Initialize four cameras
@@ -149,11 +308,40 @@ int main(int argc, char **argv)
     int fps_frame_count = 0;
     double current_fps = 0.0;
 
+    // 性能统计变量
+    double total_frame_read_time = 0.0;
+    double total_awb_time = 0.0;
+    double total_undistort_time = 0.0;
+    double total_stitching_time = 0.0;
+    double total_frame_time = 0.0;
+
+    // 创建 UMat 变量用于权重和权重补矩阵
+    cv::UMat weights_umat[4];
+    cv::UMat weights_complement_umat[4];
+
+    for (int i = 0; i < 4; ++i)
+    {
+        merge_weights_img[i].copyTo(weights_umat[i]);
+        weights_complement_img[i].copyTo(weights_complement_umat[i]);
+    }
+
+    // 预分配内存用于处理结果
+    for (int i = 0; i < 4; ++i)
+    {
+        undist_dir_img[i] = cv::Mat(project_shapes[prms[i].name], CV_8UC3);
+    }
+
     while (running)
     {
         auto frame_start_time = std::chrono::high_resolution_clock::now();
+        double frame_read_time = 0.0;
+        double awb_time = 0.0;
+        double undistort_time = 0.0;
+        double stitching_time = 0.0;
 
-        // Read frames from four cameras
+        // 1. 读取帧（计时开始）
+        auto frame_read_start = std::chrono::high_resolution_clock::now();
+
         bool all_frames_ready = true;
         for (int i = 0; i < 4; ++i)
         {
@@ -171,10 +359,15 @@ int main(int argc, char **argv)
             continue;
         }
 
+        auto frame_read_end = std::chrono::high_resolution_clock::now();
+        frame_read_time = std::chrono::duration<double, std::milli>(frame_read_end - frame_read_start).count();
+
         frame_count++;
         fps_frame_count++;
 
-        // 2. White balance and luminance balancing
+        // 2. 白平衡和亮度均衡（计时开始）
+        auto awb_start = std::chrono::high_resolution_clock::now();
+
         std::vector<cv::Mat *> srcs;
         for (int i = 0; i < 4; ++i)
         {
@@ -185,35 +378,25 @@ int main(int argc, char **argv)
         awb_and_lum_banlance(srcs);
 #endif
 
-        // 3. Distortion removal and image transformation
-        for (int i = 0; i < 4; ++i)
-        {
-            auto &prm = prms[i];
-            cv::Mat &src = origin_dir_img[i];
+        auto awb_end = std::chrono::high_resolution_clock::now();
+        awb_time = std::chrono::duration<double, std::milli>(awb_end - awb_start).count();
 
-            undist_by_remap(src, src, prm);
-            cv::warpPerspective(src, src, prm.project_matrix, project_shapes[prm.name]);
+        // 3. 畸变校正和图像变换 - 使用多线程优化（计时开始）
+        auto undistort_start = std::chrono::high_resolution_clock::now();
 
-            if (camera_flip_mir[i] == "r+")
-            {
-                cv::rotate(src, src, cv::ROTATE_90_CLOCKWISE);
-            }
-            else if (camera_flip_mir[i] == "r-")
-            {
-                cv::rotate(src, src, cv::ROTATE_90_COUNTERCLOCKWISE);
-            }
-            else if (camera_flip_mir[i] == "m")
-            {
-                cv::rotate(src, src, cv::ROTATE_180);
-            }
-            undist_dir_img[i] = src.clone();
-        }
+        // 使用多线程并行处理四个摄像头
+        processAllCamerasParallel(origin_dir_img, undist_dir_img, prms, undistort_maps, camera_flip_mir);
 
-        // 4. Image stitching
+        auto undistort_end = std::chrono::high_resolution_clock::now();
+        undistort_time = std::chrono::duration<double, std::milli>(undistort_end - undistort_start).count();
+
+        // 4. 图像拼接（计时开始）
+        auto stitching_start = std::chrono::high_resolution_clock::now();
+
         out_put_img.setTo(cv::Scalar(0, 0, 0));
         car_img.copyTo(out_put_img(cv::Rect(xl, yt, car_img.cols, car_img.rows)));
 
-        // 4.1 Center region copy
+        // 4.1 中心区域复制
         for (int i = 0; i < 4; ++i)
         {
             cv::Rect roi;
@@ -239,57 +422,113 @@ int main(int argc, char **argv)
             }
         }
 
-        // 4.2 Four corner blending
+        // 4.2 四个角融合 - 使用优化后的 merge_image 函数
         cv::Rect roi;
-        // Top-left corner
+        // 左上角
         roi = cv::Rect(0, 0, xl, yt);
-        merge_image(undist_dir_img[0](roi), undist_dir_img[1](roi), merge_weights_img[2], out_put_img(roi));
-        // Top-right corner
-        roi = cv::Rect(xr, 0, xl, yt);
-        merge_image(undist_dir_img[0](roi), undist_dir_img[3](cv::Rect(0, 0, xl, yt)), merge_weights_img[1], out_put_img(cv::Rect(xr, 0, xl, yt)));
-        // Bottom-left corner
-        roi = cv::Rect(0, yb, xl, yt);
-        merge_image(undist_dir_img[2](cv::Rect(0, 0, xl, yt)), undist_dir_img[1](roi), merge_weights_img[0], out_put_img(roi));
-        // Bottom-right corner
-        roi = cv::Rect(xr, 0, xl, yt);
-        merge_image(undist_dir_img[2](roi), undist_dir_img[3](cv::Rect(0, yb, xl, yt)), merge_weights_img[3], out_put_img(cv::Rect(xr, yb, xl, yt)));
+        {
+            cv::UMat src1_umat, src2_umat, out_umat;
+            undist_dir_img[0](roi).copyTo(src1_umat);
+            undist_dir_img[1](roi).copyTo(src2_umat);
+            out_put_img(roi).copyTo(out_umat);
 
-        // Calculate frame rate
+            merge_image(src1_umat, src2_umat, weights_umat[2], weights_complement_umat[2], out_umat);
+
+            out_umat.copyTo(out_put_img(roi));
+        }
+
+        // 右上角
+        roi = cv::Rect(xr, 0, xl, yt);
+        {
+            cv::UMat src1_umat, src2_umat, out_umat;
+            undist_dir_img[0](roi).copyTo(src1_umat);
+            undist_dir_img[3](cv::Rect(0, 0, xl, yt)).copyTo(src2_umat);
+            out_put_img(roi).copyTo(out_umat);
+
+            merge_image(src1_umat, src2_umat, weights_umat[1], weights_complement_umat[1], out_umat);
+
+            out_umat.copyTo(out_put_img(roi));
+        }
+
+        // 左下角
+        roi = cv::Rect(0, yb, xl, yt);
+        {
+            cv::UMat src1_umat, src2_umat, out_umat;
+            undist_dir_img[2](cv::Rect(0, 0, xl, yt)).copyTo(src1_umat);
+            undist_dir_img[1](roi).copyTo(src2_umat);
+            out_put_img(roi).copyTo(out_umat);
+
+            merge_image(src1_umat, src2_umat, weights_umat[0], weights_complement_umat[0], out_umat);
+
+            out_umat.copyTo(out_put_img(roi));
+        }
+
+        // 右下角
+        roi = cv::Rect(xr, yb, xl, yt);
+        {
+            cv::UMat src1_umat, src2_umat, out_umat;
+            undist_dir_img[2](cv::Rect(xr, 0, xl, yt)).copyTo(src1_umat);
+            undist_dir_img[3](cv::Rect(0, yb, xl, yt)).copyTo(src2_umat);
+            out_put_img(roi).copyTo(out_umat);
+
+            merge_image(src1_umat, src2_umat, weights_umat[3], weights_complement_umat[3], out_umat);
+
+            out_umat.copyTo(out_put_img(roi));
+        }
+
+        auto stitching_end = std::chrono::high_resolution_clock::now();
+        stitching_time = std::chrono::duration<double, std::milli>(stitching_end - stitching_start).count();
+
+        // 计算总帧时间
+        auto frame_end_time = std::chrono::high_resolution_clock::now();
+        double total_frame_time_current = std::chrono::duration<double, std::milli>(frame_end_time - frame_start_time).count();
+
+        // 累加性能统计
+        total_frame_read_time += frame_read_time;
+        total_awb_time += awb_time;
+        total_undistort_time += undistort_time;
+        total_stitching_time += stitching_time;
+        total_frame_time += total_frame_time_current;
+
+        // 计算帧率
         auto current_time = std::chrono::high_resolution_clock::now();
         auto time_diff = std::chrono::duration_cast<std::chrono::milliseconds>(current_time - last_fps_time).count();
 
-        // Update FPS display every second
+        // 每秒更新一次FPS显示和性能统计
         if (time_diff > 1000)
         {
             current_fps = fps_frame_count * 1000.0 / time_diff;
             fps_frame_count = 0;
             last_fps_time = current_time;
 
-            // Output FPS info to console
+            // 输出性能统计到控制台
             std::cout << "Current FPS: " << current_fps << " FPS" << std::endl;
+            std::cout << "Stage Timings (ms):" << std::endl;
+            std::cout << "  Frame Read: " << total_frame_read_time / frame_count << std::endl;
+            std::cout << "  AWB & Luminance: " << total_awb_time / frame_count << std::endl;
+            std::cout << "  Undistort & Transform: " << total_undistort_time / frame_count << std::endl;
+            std::cout << "  Image Stitching: " << total_stitching_time / frame_count << std::endl;
+            std::cout << "  Total Frame Time: " << total_frame_time / frame_count << std::endl;
         }
 
-        // Display FPS information on image
+        // 在图像上显示FPS信息
         std::string fps_text = "FPS: " + std::to_string(static_cast<int>(current_fps));
         std::string frame_text = "Frames: " + std::to_string(frame_count);
 
-        // Set text properties
         int font_face = cv::FONT_HERSHEY_SIMPLEX;
         double font_scale = 0.7;
         int thickness = 2;
-        cv::Scalar text_color(0, 255, 0); // Green text
-        cv::Scalar bg_color(0, 0, 0);     // Black background
+        cv::Scalar text_color(0, 255, 0);
+        cv::Scalar bg_color(0, 0, 0);
 
-        // Get text size
         int baseline = 0;
         cv::Size fps_text_size = cv::getTextSize(fps_text, font_face, font_scale, thickness, &baseline);
         cv::Size frame_text_size = cv::getTextSize(frame_text, font_face, font_scale, thickness, &baseline);
 
-        // Display FPS info at top-left corner with background for better readability
         int padding = 5;
         cv::Point text_org(10, 30);
 
-        // Draw semi-transparent background
+        // 绘制半透明背景
         cv::Rect bg_rect(text_org.x - padding, text_org.y - fps_text_size.height - padding,
                          std::max(fps_text_size.width, frame_text_size.width) + 2 * padding,
                          fps_text_size.height + frame_text_size.height + 3 * padding);
@@ -297,15 +536,15 @@ int main(int argc, char **argv)
         cv::Mat bg_overlay(roi_bg.size(), roi_bg.type(), bg_color);
         cv::addWeighted(bg_overlay, 0.3, roi_bg, 0.7, 0, roi_bg);
 
-        // Draw FPS text
+        // 绘制FPS文本
         cv::putText(out_put_img, fps_text, text_org, font_face, font_scale, text_color, thickness);
         cv::putText(out_put_img, frame_text, cv::Point(text_org.x, text_org.y + fps_text_size.height + 10),
                     font_face, font_scale, text_color, thickness);
 
-        // Display result
+        // 显示结果
         cv::imshow("360 Surround View", out_put_img);
 
-        // Handle keyboard input
+        // 处理键盘输入
         char key = cv::waitKey(1);
         if (key == 'q' || key == 'Q')
         {
@@ -320,7 +559,7 @@ int main(int argc, char **argv)
         }
     }
 
-    // Calculate total average frame rate
+    // 计算总平均帧率
     auto end_time = std::chrono::high_resolution_clock::now();
     auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
     double average_fps = (total_duration > 0) ? frame_count * 1000.0 / total_duration : 0;
@@ -330,7 +569,18 @@ int main(int argc, char **argv)
     std::cout << "Total runtime: " << total_duration / 1000.0 << " seconds" << std::endl;
     std::cout << "Average FPS: " << average_fps << " FPS" << std::endl;
 
-    // Release resources
+    // 输出最终性能统计
+    if (frame_count > 0)
+    {
+        std::cout << "Final Performance Statistics (average per frame):" << std::endl;
+        std::cout << "  Frame Read: " << total_frame_read_time / frame_count << " ms" << std::endl;
+        std::cout << "  AWB & Luminance: " << total_awb_time / frame_count << " ms" << std::endl;
+        std::cout << "  Undistort & Transform: " << total_undistort_time / frame_count << " ms" << std::endl;
+        std::cout << "  Image Stitching: " << total_stitching_time / frame_count << " ms" << std::endl;
+        std::cout << "  Total Frame Time: " << total_frame_time / frame_count << " ms" << std::endl;
+    }
+
+    // 释放资源
     for (int i = 0; i < 4; ++i)
     {
         caps[i].release();

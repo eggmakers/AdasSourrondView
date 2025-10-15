@@ -3,8 +3,7 @@
  * author: joker.mao
  * date: 2023/07/15
  * copyright: ADAS_EYES all right reserved
-*/
-
+ */
 
 #ifndef COM_H
 #define COM_H
@@ -22,19 +21,28 @@ struct CameraPrms
 
     cv::Mat scale_xy;
     cv::Mat shift_xy;
+
+    // 预计算的映射表
+    cv::Mat map1;
+    cv::Mat map2;
+
+    // 合并后的变换矩阵
+    cv::Mat combined_transform;
 };
 
-struct BgrSts {
+struct BgrSts
+{
     int b;
     int g;
     int r;
 
-    BgrSts() {
+    BgrSts()
+    {
         b = g = r = 0;
     }
 };
 
-template<typename _T>
+template <typename _T>
 static inline _T clip(float data, int max)
 {
     if (data > max)
@@ -42,11 +50,11 @@ static inline _T clip(float data, int max)
     return (_T)data;
 }
 
-void display_mat(cv::Mat& img, std::string name);
-bool read_prms(const std::string& path, CameraPrms& prms);
-bool save_prms(const std::string& path, CameraPrms& prms);
-void undist_by_remap(const cv::Mat& src, cv::Mat& dst, const CameraPrms& prms);
+void display_mat(cv::Mat &img, std::string name);
+bool read_prms(const std::string &path, CameraPrms &prms);
+bool save_prms(const std::string &path, CameraPrms &prms);
+void undist_by_remap(const cv::Mat &src, cv::Mat &dst, const CameraPrms &prms);
 
-void merge_image(cv::Mat src1, cv::Mat src2, cv::Mat w, cv::Mat out);
-void awb_and_lum_banlance(std::vector<cv::Mat*> srcs);
+void merge_image(cv::UMat src1, cv::UMat src2, cv::UMat weights, cv::UMat weights_complement, cv::UMat out);
+void awb_and_lum_banlance(std::vector<cv::Mat *> srcs);
 #endif

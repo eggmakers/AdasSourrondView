@@ -1,38 +1,106 @@
-# 360 Surround-View C++ Project
-## WeChat&知乎：ADAS之眼
+# 360°环视系统 C++ 项目 
 
-![wechat](./doc/wechat.png)
+## 项目概述
 
-**[个人博客网站传送门](https://jokereyeadas.github.io)**
+这是一个基于 C++ 和 OpenCV 实现的 360° 环视系统（Surround-View System）项目。该项目旨在将来自车辆四周（前、后、左、右）的四个鱼眼摄像头图像进行校正、变换和拼接，生成车辆周围的全景鸟瞰图，常用于高级驾驶辅助系统 (ADAS)。
 
-## Reference Repo
+核心功能包括：
+- 鱼眼镜头图像去畸变
+- 图像透视变换与旋转校正
+- 多路图像实时拼接与融合
+- 白平衡与亮度平衡处理
+- 实时视频流处理与显示
 
-|index|repo|info|
-|----|----|----|
-|1|[surround-view-system-introduction](https://github.com/neozhaoliang/surround-view-system-introduction)|python verison, refrence repo for 2D avm|
-|2|[3d surround-view-system](https://github.com/SokratG/Surround-View)|cuda+opengl verison, for 3d avm|
-
-the project params described doc link:
-
-[surrond view doc](https://github.com/neozhaoliang/surround-view-system-introduction/blob/master/doc/en.md)
-
-## How To Build And Run？
-* build
+## 项目结构
 
 ```
-#!/bin/bash
-mkdir build
-cd build 
-cmake ..
-make
+.
+├── CMakeLists.txt              # CMake 构建配置文件
+├── readme.md                   # 项目说明文档
+├── avm_app_demo.cpp            # 主应用程序：实时环视
+├── avm_cali_demo.cpp           # 标定工具：用于生成相机参数
+├── test_cam.cpp                # 摄像头测试工具
+├── srcs/                       # 源代码目录
+│   ├── common.cpp              # 核心图像处理函数实现
+│   ├── common.h                # 核心图像处理函数声明
+│   └── prms.hpp                # 项目参数与配置
+├── yaml/                       # 相机标定参数与融合权重文件
+├── images/                     # 示例图像（车辆图标、测试图等）
+│   └── result/                 # 示例输出结果图
+└── doc/                        # 文档资源
 ```
-* run
 
+## 构建与运行
+
+### 先决条件
+
+- **CMake** (版本 >= 3.0)
+- **OpenCV** (已安装并配置好路径，`CMakeLists.txt` 中指定了 OpenCV 路径，可能需要根据实际环境修改)
+- **支持 GStreamer 的 OpenCV** (用于从摄像头捕获视频流)
+- **Linux 系统** (代码中使用了 Linux 特定的摄像头设备路径)
+
+### 构建步骤
+
+1.  打开终端，进入项目根目录。
+2.  创建构建目录并进入：
+    ```bash
+    mkdir build
+    cd build
+    ```
+3.  运行 CMake 配置：
+    ```bash
+    cmake ..
+    ```
+4.  编译项目：
+    ```bash
+    make
+    ```
+
+### 运行应用
+
+构建完成后，会生成三个可执行文件：`avm_app`, `avm_cali`, `test_cam`。
+
+#### 1. `avm_app` (实时环视主程序)
+
+此程序从四个摄像头设备读取实时视频流，处理并显示拼接后的 360° 环视图。
+
+**运行命令：**
+```bash
+./avm_app ../
 ```
-# make sure data(images amd yaml) path is ../ 
-./avm_app ../ #(../ is the image and yaml data path)
+**说明：**
+- `../` 是数据文件（`images/` 和 `yaml/` 目录）的路径。
+- 程序会尝试打开 `/dev/video44`, `/dev/video71`, `/dev/video53`, `/dev/video62` 四个摄像头设备。
+- **交互：**
+    - 按 `q` 或 `Q` 退出程序。
+    - 按 `s` 或 `S` 保存当前帧为 PNG 图片。
+
+#### 2. `avm_cali` (相机标定工具)
+
+此工具用于生成每个摄像头的标定参数文件（`.yaml`），这些文件对于图像校正至关重要。
+
+**运行命令：**
+```bash
+./avm_cali ../
 ```
-## Result
-|awb and lum banlance disable|awb and lum banlance enable|
-|----|----|
-|![no banlance](./images/result/ADAS_EYES_360_VIEW_AWB_DISABLE.png)|![banlance](./images/result/ADAS_EYES_360_VIEW_AWB_ENABLE.png)|
+**说明：**
+- `../` 是数据文件路径。
+- 运行此工具需要先准备好标定板图像或按提示操作。
+
+#### 3. `test_cam` (摄像头测试工具)
+
+用于测试摄像头设备是否能正常打开和读取帧。
+
+**运行命令：**
+```bash
+./test_cam
+```
+
+## 开发约定
+
+- **语言与库：** 使用 C++ 语言和 OpenCV 库进行开发。
+- **代码风格：** 遵循常见的 C++ 编码规范，函数和变量命名清晰。
+- **模块化：** 核心图像处理逻辑封装在 `srcs/common.cpp` 和 `srcs/common.h` 中。
+- **参数配置：** 项目参数（如图像尺寸、坐标、摄像头名称等）集中定义在 `srcs/prms.hpp`。
+- **标定文件：** 每个摄像头的内参、畸变系数、投影矩阵等存储在 `yaml/` 目录下的独立 `.yaml` 文件中。
+- **权重图：** 图像融合的权重图存储在 `yaml/weights.png` 文件中，是一个 4 通道的 PNG 图像。
